@@ -1,0 +1,25 @@
+# Blender backup/temp
+*.blend1
+*.blend2
+*.blend3
+*.blend4
+*.blend5
+*_tmp.blend
+*.bphys
+
+# Blender auto-save/crash
+*.crash.txt
+
+# Rendered output
+/render/
+/output/
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python cache (Blender scripts)
+__pycache__/
+*.py[cod]

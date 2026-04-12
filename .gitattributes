@@ -1,0 +1,39 @@
+# Blender files are binary
+*.blend binary
+*.blend1 binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.exr binary
+*.hdr binary
+*.tiff binary
+*.tga binary
+*.bmp binary
+
+# 3D assets
+*.fbx binary
+*.obj binary
+*.stl binary
+*.glb binary
+*.gltf binary
+*.abc binary
+*.usd binary
+*.usda binary
+*.usdc binary
+*.usdz binary
+
+# Audio/Video
+*.mp4 binary
+*.mov binary
+*.avi binary
+*.wav binary
+*.mp3 binary
+
+# Git LFS (必要に応じてコメント解除)
+# *.blend filter=lfs diff=lfs merge=lfs -text
+# *.png filter=lfs diff=lfs merge=lfs -text
+# *.exr filter=lfs diff=lfs merge=lfs -text
+# *.hdr filter=lfs diff=lfs merge=lfs -text
+# *.fbx filter=lfs diff=lfs merge=lfs -text
