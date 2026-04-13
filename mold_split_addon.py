@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Mold Split",
     "author": "Auto-generated",
-    "version": (2, 0, 0),
+    "version": (2, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Mold Split",
     "description": "Generate resin mold with interlocking step from target object",
@@ -43,7 +43,8 @@ def _order_boundary_loop(boundary_edges):
 
 
 def _newell_normal(positions: list[Vector]) -> Vector:
-    """Polygon normal via Newell method."""
+    """Polygon normal via Newell method.  Returns fallback Z-up for
+    degenerate (collinear / coincident) input."""
     n = Vector()
     nv = len(positions)
     for i in range(nv):
@@ -51,21 +52,29 @@ def _newell_normal(positions: list[Vector]) -> Vector:
         n.x += (c.y - nx.y) * (c.z + nx.z)
         n.y += (c.z - nx.z) * (c.x + nx.x)
         n.z += (c.x - nx.x) * (c.y + nx.y)
+    if n.length_squared < 1e-12:
+        return Vector((0, 0, 1))
     n.normalize()
     return n
 
 
-def _build_cut_surface(target_obj, boundary_indices, thickness, step_pct,
-                       draft_deg: float = 90.0):
-    """Build a stepped cut surface with guaranteed ≥90° corners.
+def _apply_modifier(context, obj, mod_name: str):
+    """Select + activate *obj*, then apply modifier by name."""
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+    bpy.ops.object.modifier_apply(modifier=mod_name)
 
-    At each boundary-loop vertex an **outer corner vertex** (L1c / L2c) is
-    inserted so that the step base quad and two step-wall quads all have
-    exact right angles.  No face in the step profile has an internal angle
-    less than the requested *draft_deg* (≥ 90°).
 
-    *draft_deg* controls the wall-to-base angle (default 90° = vertical wall,
-    larger values tilt the wall outward for easier release).
+def _build_cut_surface(context, target_obj, boundary_indices, thickness,
+                       step_pct, draft_deg: float = 90.0):
+    """Build a stepped cut surface using per-vertex miter offsets.
+
+    4 layers per boundary vertex:
+      L0 — original boundary position
+      L1 — outward by step_h along mitered direction (step ledge)
+      L2 — L1 + loop_normal * step_h (step wall top)
+      L3 — extension flange far outward
 
     Returns ``(cut_object, loop_normal)`` or ``(None, None)``.
     """
@@ -95,16 +104,12 @@ def _build_cut_surface(target_obj, boundary_indices, thickness, step_pct,
     loop_normal = _newell_normal(positions)
     loop_centroid = sum(positions, Vector()) / num
 
-    # Ensure loop_normal points outward (away from mesh centre toward
-    # the mold exterior) so that the step wall goes in the pull direction.
     if loop_normal.dot(loop_centroid - mesh_center) < 0:
         loop_normal = -loop_normal
 
     bm.free()
 
-    # per-edge outward direction: loop_normal × edge_dir, pointing away
-    # from the loop centroid.  This is purely geometric — no face lookup
-    # required, which avoids all interior-face detection pitfalls.
+    # per-edge outward direction
     edge_out: list[Vector] = []
     for i in range(num):
         j = (i + 1) % num
@@ -115,7 +120,7 @@ def _build_cut_surface(target_obj, boundary_indices, thickness, step_pct,
             out = -out
         edge_out.append(out)
 
-    # per-vertex mitered outward (for extension flange only)
+    # per-vertex mitered outward — single direction per vertex
     vmiter: list[Vector] = []
     for i in range(num):
         prev = (i - 1) % num
@@ -124,32 +129,22 @@ def _build_cut_surface(target_obj, boundary_indices, thickness, step_pct,
         d = avg.dot(edge_out[i])
         vmiter.append(avg * (1.0 / max(d, 0.01)))
 
-    # ------ build vertices (8 per boundary vert) ------
+    # ------ build vertices (4 per boundary vert) ------
     cbm = bmesh.new()
-    L0, L1p, L1n, L1c = [], [], [], []
-    L2p, L2n, L2c, L3 = [], [], [], []
+    L0, L1, L2, L3 = [], [], [], []
     for j in range(num):
         p = positions[j]
         nm = loop_normal
-        po = edge_out[(j - 1) % num]
-        no = edge_out[j]
+        m = vmiter[j]
 
         l0 = p
-        l1p = p + po * step_h
-        l1n = p + no * step_h
-        l1c = p + po * step_h + no * step_h          # outer corner
-        l2p = l1p + nm * step_h + po * draft_off
-        l2n = l1n + nm * step_h + no * draft_off
-        l2c = l1c + nm * step_h + po * draft_off + no * draft_off
-        l3 = p + vmiter[j] * extension + nm * step_h + vmiter[j] * draft_off
+        l1 = p + m * step_h
+        l2 = l1 + nm * step_h + m * draft_off
+        l3 = p + m * extension + nm * step_h + m * draft_off
 
         L0.append(cbm.verts.new(l0))
-        L1p.append(cbm.verts.new(l1p))
-        L1n.append(cbm.verts.new(l1n))
-        L1c.append(cbm.verts.new(l1c))
-        L2p.append(cbm.verts.new(l2p))
-        L2n.append(cbm.verts.new(l2n))
-        L2c.append(cbm.verts.new(l2c))
+        L1.append(cbm.verts.new(l1))
+        L2.append(cbm.verts.new(l2))
         L3.append(cbm.verts.new(l3))
     cbm.verts.ensure_lookup_table()
 
@@ -157,26 +152,17 @@ def _build_cut_surface(target_obj, boundary_indices, thickness, step_pct,
     # centre face
     cbm.faces.new(list(reversed(L0)))
 
-    # per-edge faces
+    # per-edge quads (3 bands: step base, step wall, extension)
     for i in range(num):
         j = (i + 1) % num
-        cbm.faces.new([L0[i],  L0[j],  L1p[j], L1n[i]])   # step base
-        cbm.faces.new([L1n[i], L1p[j], L2p[j], L2n[i]])   # step wall
-        cbm.faces.new([L2n[i], L2p[j], L3[j],  L3[i]])    # extension
-
-    # corner faces (all internal angles ≥ 90°)
-    for j in range(num):
-        cbm.faces.new([L0[j],  L1n[j], L1c[j], L1p[j]])   # base quad
-        cbm.faces.new([L1p[j], L1c[j], L2c[j], L2p[j]])   # wall A (prev dir)
-        cbm.faces.new([L1c[j], L1n[j], L2n[j], L2c[j]])   # wall B (next dir)
-        cbm.faces.new([L2p[j], L2c[j], L3[j]])             # ext tri A
-        cbm.faces.new([L2c[j], L2n[j], L3[j]])             # ext tri B
+        cbm.faces.new([L0[i], L0[j], L1[j], L1[i]])   # step base
+        cbm.faces.new([L1[i], L1[j], L2[j], L2[i]])   # step wall
+        cbm.faces.new([L2[i], L2[j], L3[j], L3[i]])   # extension flange
 
     mesh = bpy.data.meshes.new("_MoldSplit_Cut")
     cbm.to_mesh(mesh)
     cbm.free()
 
-    # recalculate normals
     bm2 = bmesh.new()
     bm2.from_mesh(mesh)
     bmesh.ops.recalc_face_normals(bm2, faces=bm2.faces)
@@ -184,13 +170,12 @@ def _build_cut_surface(target_obj, boundary_indices, thickness, step_pct,
     bm2.free()
 
     obj = bpy.data.objects.new("_MoldSplit_Cut", mesh)
-    bpy.context.collection.objects.link(obj)
+    context.collection.objects.link(obj)
 
-    bpy.context.view_layer.objects.active = obj
     mod = obj.modifiers.new("Solidify", 'SOLIDIFY')
     mod.thickness = 1e-6
     mod.offset = -1.0
-    bpy.ops.object.modifier_apply(modifier=mod.name)
+    _apply_modifier(context, obj, mod.name)
 
     return obj, loop_normal
 
@@ -238,15 +223,14 @@ class MOLDSPLIT_OT_generate(bpy.types.Operator):
         context.collection.objects.link(mold_obj)
         mold_obj.matrix_world = target.matrix_world.copy()
 
-        context.view_layer.objects.active = mold_obj
         mod = mold_obj.modifiers.new("Solidify", 'SOLIDIFY')
         mod.thickness = thickness
         mod.offset = 1.0
-        bpy.ops.object.modifier_apply(modifier=mod.name)
+        _apply_modifier(context, mold_obj, mod.name)
 
         # steps 2-5: cut surface
         cut_obj, loop_normal = _build_cut_surface(
-            target, boundary, thickness, step_pct, draft_deg,
+            context, target, boundary, thickness, step_pct, draft_deg,
         )
         if cut_obj is None:
             bpy.data.objects.remove(mold_obj, do_unlink=True)
@@ -256,12 +240,20 @@ class MOLDSPLIT_OT_generate(bpy.types.Operator):
         cut_obj.matrix_world = target.matrix_world.copy()
 
         # steps 6-7: boolean
-        context.view_layer.objects.active = mold_obj
         bmod = mold_obj.modifiers.new("Boolean", 'BOOLEAN')
         bmod.operation = 'DIFFERENCE'
+        bmod.solver = 'EXACT'
         bmod.object = cut_obj
-        bpy.ops.object.modifier_apply(modifier=bmod.name)
+        _apply_modifier(context, mold_obj, bmod.name)
         bpy.data.objects.remove(cut_obj, do_unlink=True)
+
+        # check boolean produced usable geometry
+        if len(mold_obj.data.vertices) == 0:
+            bpy.data.objects.remove(mold_obj, do_unlink=True)
+            self.report({'ERROR'},
+                        "Boolean failed — check mesh is manifold and "
+                        "seam loop fully divides the surface.")
+            return {'CANCELLED'}
 
         # step 8: separate
         bpy.ops.object.select_all(action='DESELECT')
@@ -319,7 +311,8 @@ class MoldSplitProperties(bpy.types.PropertyGroup):
     )
     step_pct: FloatProperty(
         name="Lip %",
-        description="Interlocking lip as percentage of wall thickness (higher = better interlocking)",
+        description="Interlocking lip as percentage of wall thickness "
+                    "(higher = better interlocking)",
         default=70.0,
         min=10.0,
         max=90.0,
